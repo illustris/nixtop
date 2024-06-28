@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+set -e
+
+# Default options
+delay=0.5
+once=false
+
+# Parse options
+while getopts ":d:1" opt; do
+	case ${opt} in
+		d ) delay=$OPTARG
+		    ;;
+		1 ) once=true
+		    ;;
+		\? ) echo "Usage: nix-top [-d delay] [-1]"
+		     exit 1
+		     ;;
+	esac
+done
+
+# Terminal control sequences
+VT_CLEAR_LINE=$(tput el)
+VT_CLEAR_REST=$(tput ed)
+VT_HOME=$(tput cup 0 0)
+
+# Saves current terminal settings
+stty_saved=$(stty -g)
+
+# Function to restore terminal settings on exit
+function cleanup {
+	stty "$stty_saved"
+	echo ""
+	exit
+}
+trap cleanup EXIT
+
+# Function to get terminal size
+function get_terminal_size {
+	echo "$(tput cols) $(tput lines)"
+}
+
+# Function to get build users
+function build_users {
+	getent group nixbld | cut -d: -f4 | tr ',' ' '
+}
+
+# Function to get active build users
+function active_build_users {
+	for user in $(build_users); do
+		if pgrep -fu "$user" >/dev/null; then
+			echo "$user"
+		fi
+	done
+}
+
+# Function to get build processes
+function get_processes {
+	local user pids
+	for user in $(active_build_users); do
+		pids=$(pgrep -u "$user")
+		if [ -n "$pids" ]; then
+			local path
+			path=$(get_out_path "$user" "$(echo "$pids" | head -n 1)")
+			echo "$user:$path:$(echo "$pids" | tr '\n' ' ')"
+		fi
+	done
+}
+
+# Function to get the output path
+function get_out_path {
+	local user=$1
+	local build_dir
+
+	build_dir=$(find -L /tmp -maxdepth 1 -user "$user" -printf '%T@:%p\n' 2>/dev/null | sort -n | tail -n 1 | cut -d: -f2)
+
+	if [ -n "$build_dir" ]; then
+		local env_file="${build_dir}/env-vars"
+		if [ -f "$env_file" ]; then
+			grep -m 1 "^declare -x out=" "$env_file" | cut -d\" -f2 || echo "$build_dir"
+		else
+			echo "$build_dir"
+		fi
+	else
+		echo "(unknown)"
+	fi
+}
+
+# Function to print per output information
+function per_output_infos {
+	local user=$1
+	local pids=$2
+	local path=$3
+
+	echo ":: ($user) → $path"
+	ps -o uid,pid,ppid,stime,time,command -U "$user"
+}
+
+# Function to print screen information
+function print_screen {
+	local processes
+	processes=$(get_processes)
+	local lines=()
+	local sep=("" " * * * " "")
+
+	if [ -z "$processes" ]; then
+		lines+=("No active build processes found.")
+	else
+		lines+=("Summary per output")
+		while IFS=: read -r user path pids; do
+			lines+=("    $(echo "$pids" | wc -w) → $path")
+		done <<< "$processes"
+		lines+=("${sep[@]}")
+		while IFS=: read -r user path pids; do
+			lines+=("$(per_output_infos "$user" "$pids" "$path")")
+		done <<< "$processes"
+	fi
+
+	printf "%s\n" "${lines[@]}"
+}
+
+# Function to display screen
+function display {
+	local screen="$1"
+	local width height
+	read -r width height <<< "$(get_terminal_size)"
+
+	screen=$(
+		echo "$screen" | head -n "$height" | while IFS= read -r line;
+		do
+			printf "%-${width}s%s\n" "${line:0:$width}" "$VT_CLEAR_LINE"
+		done
+	      )
+
+	printf "%s%s%s" "$VT_HOME" "$screen" "$VT_CLEAR_REST"
+}
+
+# Set terminal to no echo, non-canonical mode
+stty -echo -icanon
+
+# Display initial screen
+display "$(print_screen)"
+
+# Exit if only run once
+if [ "$once" = true ]; then
+	exit
+fi
+
+# Main loop
+while true; do
+	if read -rt "$delay" -n 1; then
+		exit
+	fi
+	display "$(print_screen)"
+done
